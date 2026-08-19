@@ -244,6 +244,8 @@ def perform_redaction(model_call_details: dict, result, redact_streaming_respons
     model_call_details["messages"] = [{"role": "user", "content": REDACTED_BY_LITELLM}]
     model_call_details["prompt"] = ""
     model_call_details["input"] = ""
+    if "instructions" in model_call_details:
+        model_call_details["instructions"] = ""
     _redact_standard_logging_object(model_call_details)
     redact_vertex_ai_metadata_from_litellm_params(model_call_details)
 
