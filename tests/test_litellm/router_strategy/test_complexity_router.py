@@ -2569,6 +2569,28 @@ class TestLLMClassifier:
         assert call_kwargs["timeout"] == 0.4
 
     @pytest.mark.asyncio
+    async def test_aclassify_llm_forwards_max_tokens(self, mock_router_instance, llm_classifier_config):
+        config: Final = {
+            **llm_classifier_config,
+            "classifier_llm_config": {
+                **llm_classifier_config["classifier_llm_config"],
+                "max_tokens": 32,
+            },
+        }
+        router: Final = ComplexityRouter(
+            model_name="test-complexity-router",
+            litellm_router_instance=mock_router_instance,
+            complexity_router_config=config,
+        )
+        mock_router_instance.acompletion = AsyncMock(return_value=_llm_response('{"tier": "SIMPLE"}'))
+
+        await router.aclassify("hi")
+
+        call_kwargs: Final = mock_router_instance.acompletion.call_args.kwargs
+        assert call_kwargs["max_tokens"] == 32
+        assert call_kwargs["proxy_server_request"]["body"]["max_tokens"] == 32
+
+    @pytest.mark.asyncio
     async def test_aclassify_llm_success_captures_classifier_cost(self, llm_complexity_router, mock_router_instance):
         """The classifier call is billed, so its cost must ride the outcome.
 
