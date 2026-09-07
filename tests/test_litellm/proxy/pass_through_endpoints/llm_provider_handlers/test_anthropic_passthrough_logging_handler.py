@@ -1,7 +1,7 @@
 import asyncio
 import json
 from datetime import datetime
-from typing import Any, Dict, List
+from typing import Any, Dict, Final, List
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -1550,7 +1550,7 @@ class TestInterruptedStreamOutputTokenRecovery:
     def _sse(event, data):
         return f"event: {event}\ndata: {json.dumps(data)}\n\n".encode()
 
-    _MODEL = "claude-3-5-haiku-20241022"
+    _MODEL = "claude-haiku-4-5-20251001"
     _OUTPUT_TEXT = (
         "The history of computing spans centuries, beginning with mechanical "
         "calculators and the abacus, advancing through Charles Babbage's "
@@ -1675,6 +1675,100 @@ class TestInterruptedStreamOutputTokenRecovery:
         # Terminal message_delta present: recovery must not fire; the authoritative
         # provider count is preserved verbatim.
         assert usage.completion_tokens == final
+
+    @pytest.mark.parametrize("output_kind", ["thinking", "text", "tool"])
+    @pytest.mark.parametrize("completed", [False, True])
+    def test_thinking_stream_recovers_interrupted_usage(self, output_kind: str, completed: bool) -> None:
+        import litellm
+        from litellm.litellm_core_utils.prompt_templates.common_utils import get_content_from_model_response
+        from litellm.types.utils import Choices, ModelResponse
+
+        thinking: Final = "Let me carefully check each possibility before answering the question."
+        ordinary_block: Final = (
+            {"type": "tool_use", "id": "call_lookup", "name": "lookup", "input": {}}
+            if output_kind == "tool"
+            else {"type": "text", "text": ""}
+        )
+        ordinary_delta: Final = (
+            {"type": "input_json_delta", "partial_json": '{"query":"weather"}'}
+            if output_kind == "tool"
+            else {"type": "text_delta", "text": "The answer is ready."}
+        )
+        events: Final = (
+            {
+                "type": "message_start",
+                "message": {
+                    "id": "msg_thinking_disconnect",
+                    "type": "message",
+                    "role": "assistant",
+                    "model": self._MODEL,
+                    "content": [],
+                    "usage": {"input_tokens": 29, "output_tokens": 0, "cache_read_input_tokens": 50},
+                },
+            },
+            {"type": "content_block_start", "index": 0, "content_block": {"type": "thinking", "thinking": ""}},
+            {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": thinking}},
+            *(
+                (
+                    {"type": "content_block_stop", "index": 0},
+                    {"type": "content_block_start", "index": 1, "content_block": ordinary_block},
+                    {"type": "content_block_delta", "index": 1, "delta": ordinary_delta},
+                )
+                if output_kind != "thinking"
+                else ()
+            ),
+            *(
+                ({"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 7}},)
+                if completed
+                else ()
+            ),
+        )
+        now: Final = datetime.now()
+        logging_obj: Final = LiteLLMLoggingObj(
+            model=self._MODEL,
+            messages=[{"role": "user", "content": "hello"}],
+            stream=True,
+            call_type="anthropic_messages",
+            start_time=now,
+            litellm_call_id="test-thinking-disconnect",
+            function_id="test-thinking-disconnect",
+        )
+        payload: Final = AnthropicPassthroughLoggingHandler._handle_logging_anthropic_collected_chunks(
+            litellm_logging_obj=logging_obj,
+            passthrough_success_handler_obj=MagicMock(),
+            url_route="/anthropic/v1/messages",
+            request_body={"model": self._MODEL, "stream": True},
+            endpoint_type="messages",
+            start_time=now,
+            all_chunks=["data: " + json.dumps(event) for event in events],
+            end_time=now,
+        )
+        result: Final = payload["result"]
+        assert isinstance(result, ModelResponse)
+        assert isinstance(result.choices[0], Choices)
+        assert result.choices[0].message.reasoning_content == thinking
+        usage: Final = result.usage
+        assert usage.prompt_tokens == 79
+        assert usage.prompt_tokens_details.cached_tokens == 50
+        prices: Final = litellm.model_cost[self._MODEL]
+        expected_cost: Final = (
+            29 * prices["input_cost_per_token"]
+            + 50 * prices["cache_read_input_token_cost"]
+            + usage.completion_tokens * prices["output_cost_per_token"]
+        )
+        assert payload["kwargs"]["response_cost"] == pytest.approx(expected_cost)
+        assert logging_obj.model_call_details["response_cost"] == pytest.approx(expected_cost)
+        if completed:
+            assert usage.completion_tokens == 7
+            return
+        text_tokens: Final = litellm.token_counter(
+            model=self._MODEL, text=get_content_from_model_response(result), count_response_tokens=True
+        )
+        reasoning_tokens: Final = litellm.token_counter(model=self._MODEL, text=thinking, count_response_tokens=True)
+        assert usage.completion_tokens == text_tokens + reasoning_tokens
+        assert usage.completion_tokens_details.reasoning_tokens == reasoning_tokens
+        assert usage.completion_tokens_details.text_tokens == text_tokens
+        assert usage.total_tokens == usage.prompt_tokens + usage.completion_tokens
 
 
 class TestStreamFalseDeduplication:
