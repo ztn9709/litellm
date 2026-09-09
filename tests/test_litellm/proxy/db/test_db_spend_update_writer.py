@@ -44,6 +44,53 @@ def test_get_daily_spend_date_rejects_invalid_start_time():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "call_type, short_circuit, response_cost, expected_rows",
+    [
+        ("anthropic_messages", True, 0.0, 0),
+        ("aanthropic_messages", True, 0.0, 0),
+        ("anthropic_messages", False, 0.0, 1),
+        ("anthropic_messages", True, 0.005, 1),
+        ("asearch", False, 0.005, 1),
+        ("asearch", True, 0.0, 1),
+    ],
+)
+async def test_search_wrapper_does_not_duplicate_spend_records(
+    call_type: str, short_circuit: bool, response_cost: float, expected_rows: int
+):
+    writer = DBSpendUpdateWriter()
+    prisma = _tool_usage_prisma()
+    with (
+        patch("litellm.proxy.proxy_server.disable_spend_logs", False),  # test-quality-ok: TQ008 process configuration
+        patch("litellm.proxy.proxy_server.prisma_client", prisma),  # test-quality-ok: TQ008 injects an in-memory DB client
+        patch.object(writer, "_batch_database_updates", AsyncMock()) as daily_updates,
+    ):
+        await writer.update_database(
+            token="test-token",
+            user_id="test-user",
+            end_user_id="test-end-user",
+            team_id=None,
+            org_id=None,
+            kwargs={
+                "model": "test-model",
+                "call_type": call_type,
+                "websearch_short_circuit": short_circuit,
+                "litellm_params": {"metadata": {}},
+            },
+            completion_response={"id": "search-wrapper", "usage": {"input_tokens": 0, "output_tokens": 0}},
+            start_time=datetime.now(),
+            end_time=datetime.now(),
+            response_cost=response_cost,
+        )
+        await asyncio.sleep(0)
+
+    assert len(prisma.spend_log_transactions) == expected_rows
+    assert daily_updates.await_count == expected_rows
+    if expected_rows:
+        assert prisma.spend_log_transactions[0]["spend"] == response_cost
+
+
+@pytest.mark.asyncio
 async def test_daily_spend_tracking_with_disabled_spend_logs():
     """
     Test that add_spend_log_transaction_to_daily_user_transaction is still called

@@ -270,6 +270,13 @@ class DBSpendUpdateWriter:
         from litellm.proxy.utils import ProxyUpdateSpend, hash_token
 
         try:
+            if (
+                kwargs is not None
+                and kwargs.get("websearch_short_circuit") is True
+                and kwargs.get("call_type") in (CallTypes.anthropic_messages.value, CallTypes.aanthropic_messages.value)
+                and response_cost == 0
+            ):
+                return
             verbose_proxy_logger.debug(
                 "Enters prisma db call, response_cost: %s, token: %s; user_id: %s; team_id: %s",
                 response_cost,

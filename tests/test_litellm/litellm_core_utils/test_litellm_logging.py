@@ -6997,3 +6997,76 @@ def test_get_error_information_redacts_provider_key_from_upstream_url():
     assert "REDACTED" in result["traceback"]
     assert "REDACTED" in result["error_message"]
     assert result["error_code"] == "400"
+
+
+class _AgenticLoopSnapshotCaptureLogger(CustomLogger):
+    def __init__(self) -> None:
+        super().__init__()
+        self.responses: list[ModelResponse] = []
+
+    async def async_log_success_event(self, kwargs, response_obj, start_time, end_time):
+        self.responses.append(response_obj)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exception_raised", [False, True])
+async def test_agentic_loop_snapshot_deferred_logging(exception_raised: bool):
+    from litellm.litellm_core_utils.logging_worker import GLOBAL_LOGGING_WORKER
+    from litellm.proxy.common_request_processing import ProxyBaseLLMRequestProcessing
+
+    callback = _AgenticLoopSnapshotCaptureLogger()
+    start_time = datetime.datetime.now()
+    logging_obj = LitellmLogging(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": "Use the tool"}],
+        stream=True,
+        call_type=CallTypes.acompletion.value,
+        start_time=start_time,
+        litellm_call_id="agentic-loop-snapshot-call",
+        function_id="agentic-loop-snapshot-function",
+        dynamic_async_success_callbacks=[callback],
+    )
+    logging_obj.update_environment_variables(
+        litellm_params={"acompletion": True},
+        optional_params={},
+        custom_llm_provider="openai",
+    )
+    raw_response = ModelResponse(
+        id="raw-tool-call",
+        model="gpt-4o-mini",
+        usage={"prompt_tokens": 13, "completion_tokens": 5, "total_tokens": 18},
+    )
+    outer_final_response = ModelResponse(id="outer-final", model="gpt-4o-mini")
+    logging_obj._defer_async_logging = True
+    logging_obj.record_agentic_loop_response(raw_response, start_time.timestamp())
+    raw_response.usage.prompt_tokens = 999
+
+    await logging_obj.async_success_handler(
+        result=outer_final_response,
+        start_time=start_time,
+        end_time=datetime.datetime.now(),
+    )
+    assert callback.responses == []
+
+    ProxyBaseLLMRequestProcessing._flush_deferred_async_logging(logging_obj, exception_raised)
+    await GLOBAL_LOGGING_WORKER.flush()
+
+    if exception_raised:
+        assert logging_obj._enqueue_deferred_logging is None
+        assert callback.responses == []
+        return
+
+    assert [
+        (response.id, response.usage.prompt_tokens, response.usage.completion_tokens)
+        for response in callback.responses
+    ] == [("raw-tool-call", 13, 5)]
+    assert logging_obj.model_call_details["standard_logging_object"]["response"]["id"] == "raw-tool-call"
+
+    await logging_obj.async_success_handler(
+        result=outer_final_response,
+        start_time=start_time,
+        end_time=datetime.datetime.now(),
+    )
+    await GLOBAL_LOGGING_WORKER.flush()
+
+    assert len(callback.responses) == 1

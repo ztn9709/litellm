@@ -1962,7 +1962,8 @@ def client(original_function):
                             )
                         )
 
-                    logging_obj._enqueue_deferred_logging = _enqueue_deferred_logging
+                    if logging_obj._enqueue_deferred_logging is None:
+                        logging_obj._enqueue_deferred_logging = _enqueue_deferred_logging
                 else:
                     asyncio.create_task(
                         _client_async_logging_helper(
