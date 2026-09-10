@@ -241,6 +241,10 @@ class DBSpendUpdateWriter:
         self.daily_org_spend_update_queue = DailySpendUpdateQueue()
         self.daily_tag_spend_update_queue = DailySpendUpdateQueue()
         self.window_spend_update_queue = WindowSpendUpdateQueue()
+        self._batch_database_update_tasks: set[asyncio.Task[None]] = set()
+        self._batch_database_update_failure: BaseException | None = None
+        self._spend_update_commit_lock = asyncio.Lock()
+        self._daily_tag_spend_commit_lock = asyncio.Lock()
 
     async def update_database(
         # LiteLLM management object fields
@@ -336,8 +340,7 @@ class DBSpendUpdateWriter:
                     "disable_spend_logs=True. Skipping writing spend logs to db. Other spend updates - Key/User/Team table will still occur."
                 )
 
-            # Single task replaces 11 create_task() calls
-            asyncio.create_task(
+            task: Final = asyncio.create_task(
                 self._batch_database_updates(
                     response_cost=response_cost,
                     user_id=user_id,
@@ -351,6 +354,8 @@ class DBSpendUpdateWriter:
                     request_model_access_groups=get_request_model_access_groups(kwargs),
                 )
             )
+            self._batch_database_update_tasks.add(task)
+            task.add_done_callback(self._record_batch_database_update_task_result)
 
             self._enqueue_tool_registry_upsert(
                 kwargs=kwargs,
@@ -640,7 +645,7 @@ class DBSpendUpdateWriter:
         litellm_proxy_budget_name: str | None,
         payload: SpendLogsPayload,
         request_model_access_groups: Sequence[str] = (),
-    ):
+    ) -> None:
         """
         Runs all 13 spend-update helpers sequentially inside a single asyncio task.
 
@@ -801,6 +806,15 @@ class DBSpendUpdateWriter:
                 "_batch_database_updates: add_spend_log_transaction_to_daily_tag_transaction failed: %s",
                 traceback.format_exc(),
             )
+
+    def _record_batch_database_update_task_result(self, task: asyncio.Task[None]) -> None:
+        self._batch_database_update_tasks.discard(task)
+        if task.cancelled():
+            self._batch_database_update_failure = RuntimeError("Spend rollup enqueue was cancelled")
+        else:
+            task_exception: Final = task.exception()
+            if task_exception is not None:
+                self._batch_database_update_failure = task_exception
 
     async def _update_key_db(
         self,
@@ -1102,7 +1116,7 @@ class DBSpendUpdateWriter:
         prisma_client: PrismaClient,
         n_retry_times: int,
         proxy_logging_obj: ProxyLogging,
-    ):
+    ) -> None:
         """
         Handles commiting update spend transactions to db
 
@@ -1120,19 +1134,43 @@ class DBSpendUpdateWriter:
         else:
             - Regular flow of this method
         """
-        if RedisUpdateBuffer._should_commit_spend_updates_to_redis():
-            await self._commit_spend_updates_to_db_with_redis(
-                prisma_client=prisma_client,
-                n_retry_times=n_retry_times,
-                proxy_logging_obj=proxy_logging_obj,
-            )
+        async with self._spend_update_commit_lock:
+            if RedisUpdateBuffer._should_commit_spend_updates_to_redis():
+                await self._commit_spend_updates_to_db_with_redis(
+                    prisma_client=prisma_client,
+                    n_retry_times=n_retry_times,
+                    proxy_logging_obj=proxy_logging_obj,
+                )
+            else:
+                await self._commit_spend_updates_to_db_without_redis_buffer(
+                    prisma_client=prisma_client,
+                    n_retry_times=n_retry_times,
+                    proxy_logging_obj=proxy_logging_obj,
+                )
 
-        else:
-            await self._commit_spend_updates_to_db_without_redis_buffer(
+    async def flush_spend_updates_on_shutdown(
+        self,
+        prisma_client: PrismaClient,
+        proxy_logging_obj: ProxyLogging,
+    ) -> None:
+        while self._batch_database_update_tasks:
+            for task_result in await asyncio.gather(*tuple(self._batch_database_update_tasks), return_exceptions=True):
+                if isinstance(task_result, BaseException):
+                    self._batch_database_update_failure = task_result
+
+        from litellm.proxy.utils import update_daily_tag_spend
+
+        try:
+            await self.db_update_spend_transaction_handler(
                 prisma_client=prisma_client,
-                n_retry_times=n_retry_times,
+                n_retry_times=3,
                 proxy_logging_obj=proxy_logging_obj,
             )
+        finally:
+            await update_daily_tag_spend(prisma_client=prisma_client, proxy_logging_obj=proxy_logging_obj)
+
+        if self._batch_database_update_failure is not None:
+            raise RuntimeError("Spend rollup enqueue failed before shutdown") from self._batch_database_update_failure
 
     async def _commit_spend_updates_to_db_with_redis(
         self,
@@ -1410,18 +1448,19 @@ class DBSpendUpdateWriter:
         Commit only tag spend updates to database.
         This is called by a separate scheduler job at a longer interval.
         """
-        daily_tag_spend_update_transactions: Final = cast(
-            dict[str, DailyTagSpendTransaction],
-            await self.daily_tag_spend_update_queue.flush_and_get_aggregated_daily_spend_update_transactions(),
-        )
-
-        if daily_tag_spend_update_transactions:
-            await DBSpendUpdateWriter.update_daily_tag_spend(
-                n_retry_times=n_retry_times,
-                prisma_client=prisma_client,
-                proxy_logging_obj=proxy_logging_obj,
-                daily_spend_transactions=daily_tag_spend_update_transactions,
+        async with self._daily_tag_spend_commit_lock:
+            daily_tag_spend_update_transactions: Final = cast(
+                dict[str, DailyTagSpendTransaction],
+                await self.daily_tag_spend_update_queue.flush_and_get_aggregated_daily_spend_update_transactions(),
             )
+
+            if daily_tag_spend_update_transactions:
+                await DBSpendUpdateWriter.update_daily_tag_spend(
+                    n_retry_times=n_retry_times,
+                    prisma_client=prisma_client,
+                    proxy_logging_obj=proxy_logging_obj,
+                    daily_spend_transactions=daily_tag_spend_update_transactions,
+                )
 
     async def _commit_daily_tag_spend_to_db_with_redis(
         self,
@@ -1435,31 +1474,32 @@ class DBSpendUpdateWriter:
         This lets the dedicated daily tag scheduler drain both in-memory and
         Redis-backed tag transactions.
         """
-        await self.redis_update_buffer.store_in_memory_daily_tag_spend_updates_in_redis(
-            daily_tag_spend_update_queue=self.daily_tag_spend_update_queue,
-        )
+        async with self._daily_tag_spend_commit_lock:
+            await self.redis_update_buffer.store_in_memory_daily_tag_spend_updates_in_redis(
+                daily_tag_spend_update_queue=self.daily_tag_spend_update_queue,
+            )
 
-        if await self.pod_lock_manager.acquire_lock(
-            cronjob_id=DB_DAILY_TAG_SPEND_UPDATE_JOB_NAME,
-        ):
-            verbose_proxy_logger.debug("acquired lock for daily tag spend updates")
-            try:
-                await self._drain_and_commit_daily_tag_spend_from_redis(
-                    prisma_client=prisma_client,
-                    n_retry_times=n_retry_times,
-                    proxy_logging_obj=proxy_logging_obj,
-                )
-            except Exception as e:
-                spend_log_error(
-                    "Spend tracking - failed to commit daily tag spend updates from Redis to DB. "
-                    "Re-queuing to Redis for retry on next tick. Error: %s",
-                    str(e),
-                    exc=e,
-                )
-            finally:
-                await self.pod_lock_manager.release_lock(
-                    cronjob_id=DB_DAILY_TAG_SPEND_UPDATE_JOB_NAME,
-                )
+            if await self.pod_lock_manager.acquire_lock(
+                cronjob_id=DB_DAILY_TAG_SPEND_UPDATE_JOB_NAME,
+            ):
+                verbose_proxy_logger.debug("acquired lock for daily tag spend updates")
+                try:
+                    await self._drain_and_commit_daily_tag_spend_from_redis(
+                        prisma_client=prisma_client,
+                        n_retry_times=n_retry_times,
+                        proxy_logging_obj=proxy_logging_obj,
+                    )
+                except Exception as e:
+                    spend_log_error(
+                        "Spend tracking - failed to commit daily tag spend updates from Redis to DB. "
+                        "Re-queuing to Redis for retry on next tick. Error: %s",
+                        str(e),
+                        exc=e,
+                    )
+                finally:
+                    await self.pod_lock_manager.release_lock(
+                        cronjob_id=DB_DAILY_TAG_SPEND_UPDATE_JOB_NAME,
+                    )
 
     @staticmethod
     async def _commit_window_spend_updates(

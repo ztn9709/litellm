@@ -933,6 +933,14 @@ async def _flush_spend_logs_queue_on_shutdown() -> None:
         return
 
     try:
+        await proxy_logging_obj.db_spend_update_writer.flush_spend_updates_on_shutdown(
+            prisma_client=prisma_client,
+            proxy_logging_obj=proxy_logging_obj,
+        )
+    except Exception as e:  # noqa: BLE001  # shutdown must continue even if the drain fails
+        verbose_proxy_logger.exception("Error flushing spend rollups on shutdown: %s", e)
+
+    try:
         from litellm.proxy.utils import drain_spend_logs_queue
 
         await drain_spend_logs_queue(
